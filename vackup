@@ -12,12 +12,18 @@ BLACKLISTED_CONTAINERS=(
 
 # Variables
 ENABLE_REMOTE_BACKUP=false
-REMOTE_BACKUP_DIR="/root/backups"
+REMOTE_BACKUP_DIR="/backup/backups"
 SSH_KEY="$HOME/.ssh/id_rsa"
-REMOTE_CONNECTION="ssh -p 7766 -i $SSH_KEY"
+REMOTE_CONNECTION="ssh -p 8876 -i $SSH_KEY"
 REMOTE_HOST="x.x.x.x"
 REMOTE_USER="backup"
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+
+# Retention settings
+HOURLY_RETENTION=6
+DAILY_RETENTION=3
+WEEKLY_RETENTION=2
+BACKUP_TYPE="default"  # Can be "hourly", "daily", "weekly", or "default"
 
 # Cleanup any leftover temporary containers
 cleanup_temp_containers() {
@@ -87,7 +93,7 @@ backup-container CONTAINER DIR
 restore-container DIR CONTAINER
   Restores the configuration and volumes of a container from a directory
 
-backup-all DIR
+backup-all DIR [--hourly|--daily|--weekly]
   Backs up all containers to a directory
 
 EOF
@@ -385,6 +391,45 @@ backup_container_volumes() {
     done
 }
 
+# Function to clean up old backups based on retention policy
+cleanup_old_backups() {
+    local backup_dir=$1
+    local container_name=$2
+    local retention_type=$3
+    local retention_count=$4
+
+    echo "Checking for old $retention_type backups to clean up..."
+    
+    # Find all backup directories for this container
+    local backup_dirs=($(find "$backup_dir/$container_name" -maxdepth 1 -type d -name "${retention_type}_*" | sort -r))
+    
+    # Keep only the most recent backups up to retention count
+    if [ ${#backup_dirs[@]} -gt $retention_count ]; then
+        for ((i=retention_count; i<${#backup_dirs[@]}; i++)); do
+            echo "Removing old backup: ${backup_dirs[$i]}"
+            rm -rf "${backup_dirs[$i]}"
+        done
+    fi
+}
+
+# Function to get appropriate timestamp format based on backup type
+get_timestamp() {
+    case "$BACKUP_TYPE" in
+        "hourly")
+            echo "hourly_$(date +"%Y-%m-%d_%H")"
+            ;;
+        "daily")
+            echo "daily_$(date +"%Y-%m-%d")"
+            ;;
+        "weekly")
+            echo "weekly_$(date +"%Y-%m-%d")"
+            ;;
+        *)
+            echo "$TIMESTAMP"
+            ;;
+    esac
+}
+
 # Function to perform backup of a single container
 backup_single_container() {
     local container_name=$1
@@ -402,8 +447,8 @@ backup_single_container() {
         return 0
     fi
     
-    # Create timestamped backup directory
-    local backup_dir="$base_backup_dir/$container_name/$TIMESTAMP"
+    # Create timestamped backup directory using the appropriate format
+    local backup_dir="$base_backup_dir/$container_name/$(get_timestamp)"
     mkdir -p "$backup_dir"
     
     echo "##########################"
@@ -442,11 +487,29 @@ backup_single_container() {
     echo "Backup process complete for $container_name."
     echo "##########################"
     echo ""
+    
+    return 0
 }
 
 # New command to backup all containers
 cmd_backup_all() {
     local base_backup_dir=$2
+    local args=("$@")
+    
+    # Parse flags
+    for ((i=2; i<${#args[@]}; i++)); do
+        case "${args[$i]}" in
+            --hourly)
+                BACKUP_TYPE="hourly"
+                ;;
+            --daily)
+                BACKUP_TYPE="daily"
+                ;;
+            --weekly)
+                BACKUP_TYPE="weekly"
+                ;;
+        esac
+    done
     
     if [ -z "$base_backup_dir" ]; then
         error usage 'Backup directory not specified'
@@ -467,6 +530,19 @@ cmd_backup_all() {
     for container in $CONTAINERS; do
         if backup_single_container "$container" "$base_backup_dir"; then
             backed_up_containers+=("$container")
+            
+            # Clean up old backups based on retention policy
+            case "$BACKUP_TYPE" in
+                "hourly")
+                    cleanup_old_backups "$base_backup_dir" "$container" "hourly" "$HOURLY_RETENTION"
+                    ;;
+                "daily")
+                    cleanup_old_backups "$base_backup_dir" "$container" "daily" "$DAILY_RETENTION"
+                    ;;
+                "weekly")
+                    cleanup_old_backups "$base_backup_dir" "$container" "weekly" "$WEEKLY_RETENTION"
+                    ;;
+            esac
         else
             skipped_containers+=("$container")
         fi
