@@ -2,7 +2,8 @@
 
 [![DevSkim](https://github.com/Ryahn/docker-vackup/actions/workflows/devskim.yml/badge.svg)](https://github.com/Ryahn/docker-vackup/actions/workflows/devskim.yml) [![Lint Code Base](https://github.com/Ryahn/docker-vackup/actions/workflows/super-linter.yml/badge.svg)](https://github.com/Ryahn/docker-vackup/actions/workflows/super-linter.yml)
 
-**This is now an [Official Docker Desktop Extension called "Volumes Backup & Share"](https://hub.docker.com/extensions/docker/volumes-backup-extension) which has more features, but I'll keep this repo around for historial purposes.**
+**This is now an [Official Docker Desktop Extension called "Volumes Backup & Share"](https://hub.docker.com/extensions/docker/volumes-backup-extension) which has more features, but I'll keep this repository for reference.**
+
 
 Vackup: (contraction of "volume backup")
 
@@ -61,7 +62,7 @@ BLACKLISTED_CONTAINERS=(
 Download the `vackup` file in this repository to your local machine in your shell path and make it executable.
 
 ```shell
-sudo curl -sSL https://raw.githubusercontent.com/Ryahn/docker-vackup/refs/heads/main/vackup -o /usr/local/bin/vackup && sudo chmod +x /usr/local/bin/vackup
+sudo curl -sSL https://raw.githubusercontent.com/BretFisher/docker-vackup/main/vackup -o /usr/local/bin/vackup && sudo chmod +x /usr/local/bin/vackup
 ```
 
 ## Error conditions
