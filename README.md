@@ -35,12 +35,33 @@ Usage:
 `vackup load IMAGE VOLUME`
   Copies /volume-data contents from an image to a volume
 
+`vackup backup-container CONTAINER DIR`
+  Backs up the configuration and volumes of a container to a directory
+  If no container is specified, backs up all non-blacklisted containers
+
+`vackup backup-all DIR`
+  Backs up all non-blacklisted containers to a directory
+
+`vackup restore-container DIR CONTAINER`
+  Restores the configuration and volumes of a container from a directory
+
+## Container Blacklist
+
+You can exclude specific containers from being backed up by adding them to the `BLACKLISTED_CONTAINERS` array in the script. For example:
+
+```bash
+BLACKLISTED_CONTAINERS=(
+    "container1"
+    "container2"
+)
+```
+
 ## Install
 
 Download the `vackup` file in this repository to your local machine in your shell path and make it executable.
 
 ```shell
-sudo curl -sSL https://raw.githubusercontent.com/BretFisher/docker-vackup/main/vackup -o /usr/local/bin/vackup && sudo chmod +x /usr/local/bin/vackup
+sudo curl -sSL https://raw.githubusercontent.com/Ryahn/docker-vackup/refs/heads/main/vackup -o /usr/local/bin/vackup && sudo chmod +x /usr/local/bin/vackup
 ```
 
 ## Error conditions
