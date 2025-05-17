@@ -1,9 +1,44 @@
 #!/bin/bash
 # Docker Volume File Backup and Restore Tool
-# Easily tar up a volume on a local (or remote) engine
+# Safely backs up volumes without removing existing data
 # Inspired by CLIP from Lukasz Lach
 
 set -Eeo pipefail
+
+# List of containers to exclude from backup
+BLACKLISTED_CONTAINERS=(
+    ""
+)
+
+# Variables
+ENABLE_REMOTE_BACKUP=false
+REMOTE_BACKUP_DIR="/root/backups"
+SSH_KEY="$HOME/.ssh/id_rsa"
+REMOTE_CONNECTION="ssh -p 7766 -i $SSH_KEY"
+REMOTE_HOST="x.x.x.x"
+REMOTE_USER="backup"
+TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+
+# Cleanup any leftover temporary containers
+cleanup_temp_containers() {
+    echo "Checking for leftover temporary containers..."
+    # Find any containers that match our temporary container pattern
+    TEMP_CONTAINERS=$(docker ps -a --filter "name=vackup-temp-" --format "{{.Names}}")
+    
+    if [ ! -z "$TEMP_CONTAINERS" ]; then
+        echo "Found leftover temporary containers, cleaning up..."
+        for container in $TEMP_CONTAINERS; do
+            echo "Removing container: $container"
+            docker rm -f "$container" > /dev/null 2>&1
+        done
+    else
+        echo "No leftover temporary containers found."
+    fi
+    echo ""
+}
+
+# Run cleanup at script start
+cleanup_temp_containers
 
 handle_error() {
   case $# in
@@ -24,7 +59,7 @@ trap 'handle_error $LINENO' ERR
 usage() {
 cat <<EOF
 
-"Docker Volume Backup". Replicates image management commands for volumes.
+"Docker Volume Backup". Safely backs up volumes without removing existing data.
 
 export/import copies files between a host tarball and a volume. For making
   volume backups and restores.
@@ -45,6 +80,15 @@ vackup save VOLUME IMAGE
 
 vackup load IMAGE VOLUME
   Copies /volume-data contents from an image to a volume
+
+backup-container CONTAINER DIR
+  Backs up the configuration and volumes of a container to a directory
+
+restore-container DIR CONTAINER
+  Restores the configuration and volumes of a container from a directory
+
+backup-all DIR
+  Backs up all containers to a directory
 
 EOF
 }
@@ -91,6 +135,16 @@ fulldirname() {
   echo "$DIRECTORY"
 }
 
+is_container_blacklisted() {
+    local container_name=$1
+    for blacklisted in "${BLACKLISTED_CONTAINERS[@]}"; do
+        if [ "$container_name" == "$blacklisted" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 if [ -z "$1" ] || [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
     usage
     exit 0
@@ -104,27 +158,36 @@ cmd_export() {
         error usage 'Not enough arguments'
     fi
 
-    if ! docker volume inspect --format '{{.Name}}' "$VOLUME_NAME";
-    then
+    # Check if volume exists
+    if ! docker volume inspect --format '{{.Name}}' "$VOLUME_NAME" > /dev/null 2>&1; then
         error "Volume $VOLUME_NAME does not exist"
     fi
 
-# TODO: check if file exists on host, if it does
-# create a option for overwrite and check if that's set
+    # Check if any container using this volume is blacklisted
+    CONTAINERS=$(docker ps -a --filter volume="$VOLUME_NAME" --format "{{.Names}}")
+    for container in $CONTAINERS; do
+        if is_container_blacklisted "$container"; then
+            echo "Warning: Volume $VOLUME_NAME is used by blacklisted container $container. Skipping backup."
+            return 0
+        fi
+    done
 
     DIRECTORY=$(fulldirname "$FILE_NAME")
     FILE_NAME=$(basename "$FILE_NAME")
 
+    # Create backup with timestamp
+    BACKUP_FILE="${FILE_NAME%.*}_$(date +%Y%m%d_%H%M%S).${FILE_NAME##*.}"
+    
     if ! docker run --rm \
       -v "$VOLUME_NAME":/vackup-volume \
       -v "$DIRECTORY":/vackup \
       busybox \
-      tar -zcvf /vackup/"$FILE_NAME" /vackup-volume;
+      tar -zcvf /vackup/"$BACKUP_FILE" /vackup-volume;
     then
         error 'Failed to start busybox backup container'
     fi
 
-    echo "Successfully tar'ed volume $VOLUME_NAME into file $FILE_NAME"
+    echo "Successfully backed up volume $VOLUME_NAME into file $BACKUP_FILE"
 }
 
 cmd_import() {
@@ -135,10 +198,15 @@ cmd_import() {
         error usage 'Not enough arguments'
     fi
 
-    if ! docker volume inspect --format '{{.Name}}' "$VOLUME_NAME";
-    then
-        echo "Warning: Volume $VOLUME_NAME does not exist, creating..."
-        docker volume create "$VOLUME_NAME"
+    # Check if any container using this volume is blacklisted
+    if docker volume inspect --format '{{.Name}}' "$VOLUME_NAME" > /dev/null 2>&1; then
+        CONTAINERS=$(docker ps -a --filter volume="$VOLUME_NAME" --format "{{.Names}}")
+        for container in $CONTAINERS; do
+            if is_container_blacklisted "$container"; then
+                echo "Warning: Volume $VOLUME_NAME is used by blacklisted container $container. Skipping restore."
+                return 0
+            fi
+        done
     fi
 
     if [ ! -r "$FILE_NAME" ]; then
@@ -154,16 +222,28 @@ cmd_import() {
     DIRECTORY=$(fulldirname "$FILE_NAME")
     FILE_NAME=$(basename "$FILE_NAME")
 
+    # Create volume if it doesn't exist
+    if ! docker volume inspect --format '{{.Name}}' "$VOLUME_NAME" > /dev/null 2>&1; then
+        echo "Creating volume $VOLUME_NAME..."
+        docker volume create "$VOLUME_NAME"
+    fi
+
+    # Create a temporary directory for the restore
+    TEMP_DIR=$(mktemp -d)
+    
     if ! docker run --rm \
       -v "$VOLUME_NAME":/vackup-volume \
       -v "$DIRECTORY":/vackup \
+      -v "$TEMP_DIR":/temp \
       busybox \
-      tar -xvzf /vackup/"$FILE_NAME" -C /;
+      sh -c "cp -a /vackup-volume/. /temp/ && tar -xvzf /vackup/$FILE_NAME -C / && cp -a /temp/. /vackup-volume/";
     then
+        rm -rf "$TEMP_DIR"
         error 'Failed to start busybox container'
     fi
 
-    echo "Successfully unpacked $FILE_NAME into volume $VOLUME_NAME"
+    rm -rf "$TEMP_DIR"
+    echo "Successfully restored $FILE_NAME into volume $VOLUME_NAME while preserving existing data"
 }
 
 cmd_save() {
@@ -174,26 +254,39 @@ cmd_save() {
         error usage 'Not enough arguments'
     fi
 
-    if ! docker volume inspect --format '{{.Name}}' "$VOLUME_NAME";
-    then
+    # Check if volume exists
+    if ! docker volume inspect --format '{{.Name}}' "$VOLUME_NAME" > /dev/null 2>&1; then
         error "Volume $VOLUME_NAME does not exist"
     fi
 
-    if ! docker run \
+    # Check if any container using this volume is blacklisted
+    CONTAINERS=$(docker ps -a --filter volume="$VOLUME_NAME" --format "{{.Names}}")
+    for container in $CONTAINERS; do
+        if is_container_blacklisted "$container"; then
+            echo "Warning: Volume $VOLUME_NAME is used by blacklisted container $container. Skipping backup."
+            return 0
+        fi
+    done
+
+    # Create a temporary container for the backup
+    TEMP_CONTAINER="vackup-temp-$(date +%s)"
+    
+    if ! docker run --name "$TEMP_CONTAINER" \
       -v "$VOLUME_NAME":/mount-volume \
       busybox \
       cp -Rp /mount-volume/. /volume-data/;
     then
+        docker rm -f "$TEMP_CONTAINER" > /dev/null 2>&1
         error 'Failed to start busybox container'
     fi
 
-    CONTAINER_ID=$(docker ps -lq)
+    # Create the backup image
+    docker commit -m "backup of volume $VOLUME_NAME to /volume-data" "$TEMP_CONTAINER" "$IMAGE_NAME"
+    
+    # Clean up the temporary container
+    docker rm -f "$TEMP_CONTAINER" > /dev/null 2>&1
 
-    docker commit -m "saving volume $VOLUME_NAME to /volume-data" "$CONTAINER_ID" "$IMAGE_NAME"
-
-    docker container rm "$CONTAINER_ID"
-
-    echo "Successfully copied volume $VOLUME_NAME into image $IMAGE_NAME, under /volume-data"
+    echo "Successfully backed up volume $VOLUME_NAME into image $IMAGE_NAME, under /volume-data"
 }
 
 cmd_load() {
@@ -204,21 +297,285 @@ cmd_load() {
         error usage 'Not enough arguments'
     fi
 
-    if ! docker volume inspect --format '{{.Name}}' "$VOLUME_NAME";
-    then
-      echo "Warning: Volume $VOLUME_NAME does not exist, creating..."
-      docker volume create "$VOLUME_NAME"
+    # Check if any container using this volume is blacklisted
+    if docker volume inspect --format '{{.Name}}' "$VOLUME_NAME" > /dev/null 2>&1; then
+        CONTAINERS=$(docker ps -a --filter volume="$VOLUME_NAME" --format "{{.Names}}")
+        for container in $CONTAINERS; do
+            if is_container_blacklisted "$container"; then
+                echo "Warning: Volume $VOLUME_NAME is used by blacklisted container $container. Skipping restore."
+                return 0
+            fi
+        done
     fi
 
+    # Create volume if it doesn't exist
+    if ! docker volume inspect --format '{{.Name}}' "$VOLUME_NAME" > /dev/null 2>&1; then
+        echo "Creating volume $VOLUME_NAME..."
+        docker volume create "$VOLUME_NAME"
+    fi
+
+    # Create a temporary directory for the restore
+    TEMP_DIR=$(mktemp -d)
+    
     if ! docker run --rm \
       -v "$VOLUME_NAME":/mount-volume \
+      -v "$TEMP_DIR":/temp \
       "$IMAGE_NAME" \
-      cp -Rp /volume-data/. /mount-volume/;
+      sh -c "cp -a /mount-volume/. /temp/ && cp -Rp /volume-data/. /mount-volume/ && cp -a /temp/. /mount-volume/";
     then
+        rm -rf "$TEMP_DIR"
         error "Failed to start container from $IMAGE_NAME"
     fi
 
-    echo "Successfully copied /volume-data from $IMAGE_NAME into volume $VOLUME_NAME"
+    rm -rf "$TEMP_DIR"
+    echo "Successfully restored /volume-data from $IMAGE_NAME into volume $VOLUME_NAME while preserving existing data"
+}
+
+# Function to backup container configuration
+backup_container_config() {
+    local container_name=$1
+    local backup_dir=$2
+    
+    echo "Backing up configuration for container: $container_name"
+    
+    # Create container config directory
+    mkdir -p "$backup_dir/containers/$container_name"
+    
+    # Save container configuration
+    docker inspect "$container_name" > "$backup_dir/containers/$container_name/config.json"
+    
+    # Save environment variables
+    docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' "$container_name" > "$backup_dir/containers/$container_name/env.txt"
+    
+    # Save container labels
+    docker inspect --format='{{range $k,$v := .Config.Labels}}{{println $k "=" $v}}{{end}}' "$container_name" > "$backup_dir/containers/$container_name/labels.txt"
+    
+    # Save container ports
+    docker inspect --format='{{range $p,$conf := .HostConfig.PortBindings}}{{println $p "->" $conf}}{{end}}' "$container_name" > "$backup_dir/containers/$container_name/ports.txt"
+    
+    # Save container volumes
+    docker inspect --format='{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}' "$container_name" > "$backup_dir/containers/$container_name/volumes.txt"
+}
+
+# Function to backup container volumes
+backup_container_volumes() {
+    local container_name=$1
+    local backup_dir=$2
+    
+    echo "Backing up volumes for container: $container_name"
+    
+    # Get container volumes
+    VOLUMES=$(docker inspect --format='{{range .Mounts}}{{.Source}} {{end}}' "$container_name")
+    
+    for volume in $VOLUMES; do
+        if [ -d "$volume" ]; then
+            VOLUME_NAME=$(basename "$volume")
+            echo "Backing up volume: $VOLUME_NAME"
+            
+            # Create volume backup directory
+            mkdir -p "$backup_dir/volumes/$VOLUME_NAME"
+            
+            # Backup volume contents
+            docker run --rm \
+                -v "$volume":/vackup-volume \
+                -v "$backup_dir/volumes/$VOLUME_NAME":/vackup \
+                busybox \
+                tar -zcvf /vackup/backup.tar.gz /vackup-volume
+        fi
+    done
+}
+
+# Function to perform backup of a single container
+backup_single_container() {
+    local container_name=$1
+    local base_backup_dir=$2
+    
+    # Check if container exists
+    if ! docker ps -a --format "{{.Names}}" | grep -q "^$container_name$"; then
+        echo "Warning: Container $container_name does not exist. Skipping."
+        return 1
+    fi
+    
+    # Check if container is blacklisted
+    if is_container_blacklisted "$container_name"; then
+        echo "Warning: Container $container_name is blacklisted. Skipping backup."
+        return 0
+    fi
+    
+    # Create timestamped backup directory
+    local backup_dir="$base_backup_dir/$container_name/$TIMESTAMP"
+    mkdir -p "$backup_dir"
+    
+    echo "##########################"
+    echo "Starting backup of $container_name..."
+    echo "##########################"
+    echo ""
+    
+    # Backup container configuration
+    backup_container_config "$container_name" "$backup_dir"
+    
+    # Backup container volumes
+    backup_container_volumes "$container_name" "$backup_dir"
+    
+    echo "##########################"
+    echo "Backup complete: $backup_dir"
+    echo "##########################"
+    echo ""
+    
+    if [ "$ENABLE_REMOTE_BACKUP" = true ]; then
+        # Sync to remote backup server
+        echo "##########################"
+        echo "Syncing to backup server..."
+        echo "##########################"
+        echo ""
+        
+        # Check if SSH key exists before attempting rsync
+        if [ -f "$SSH_KEY" ]; then
+            rsync -av --progress -e "$REMOTE_CONNECTION" "$backup_dir" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_BACKUP_DIR/$container_name/"
+            echo "Successfully synced backup to remote server"
+        else
+            echo "Warning: SSH key not found at $SSH_KEY. Skipping remote backup."
+        fi
+    fi
+    
+    echo "##########################"
+    echo "Backup process complete for $container_name."
+    echo "##########################"
+    echo ""
+}
+
+# New command to backup all containers
+cmd_backup_all() {
+    local base_backup_dir=$2
+    
+    if [ -z "$base_backup_dir" ]; then
+        error usage 'Backup directory not specified'
+    fi
+    
+    echo "##########################"
+    echo "Starting backup of all containers..."
+    echo "##########################"
+    echo ""
+    
+    # Get all container names
+    CONTAINERS=$(docker ps -a --format "{{.Names}}")
+    
+    # Array to store successfully backed up containers
+    local backed_up_containers=()
+    local skipped_containers=()
+    
+    for container in $CONTAINERS; do
+        if backup_single_container "$container" "$base_backup_dir"; then
+            backed_up_containers+=("$container")
+        else
+            skipped_containers+=("$container")
+        fi
+    done
+    
+    echo "##########################"
+    echo "Backup Summary:"
+    echo "##########################"
+    echo ""
+    
+    if [ ${#backed_up_containers[@]} -gt 0 ]; then
+        echo "Successfully backed up containers:"
+        for container in "${backed_up_containers[@]}"; do
+            echo "  - $container"
+        done
+        echo ""
+    fi
+    
+    if [ ${#skipped_containers[@]} -gt 0 ]; then
+        echo "Skipped containers:"
+        for container in "${skipped_containers[@]}"; do
+            echo "  - $container"
+        done
+        echo ""
+    fi
+    
+    echo "Total containers backed up: ${#backed_up_containers[@]}"
+    echo "Total containers skipped: ${#skipped_containers[@]}"
+    echo ""
+    echo "##########################"
+    echo "Backup of all containers complete."
+    echo "##########################"
+    echo ""
+}
+
+# New command to backup entire container
+cmd_backup_container() {
+    local container_name=$2
+    local base_backup_dir=$3
+    
+    if [ -z "$base_backup_dir" ]; then
+        error usage 'Backup directory not specified'
+    fi
+    
+    if [ -z "$container_name" ]; then
+        # If no container specified, backup all containers
+        echo "No container specified. Backing up all containers..."
+        cmd_backup_all "$1" "$base_backup_dir"
+        return
+    fi
+    
+    backup_single_container "$container_name" "$base_backup_dir"
+}
+
+# New command to restore container
+cmd_restore_container() {
+    local backup_dir=$2
+    local container_name=$3
+    
+    if [ -z "$container_name" ] || [ -z "$backup_dir" ]; then
+        error usage 'Not enough arguments'
+    fi
+    
+    # Check if backup directory exists
+    if [ ! -d "$backup_dir" ]; then
+        error "Backup directory $backup_dir does not exist"
+    fi
+    
+    # Check if container config exists
+    if [ ! -f "$backup_dir/containers/$container_name/config.json" ]; then
+        error "Container configuration not found in backup"
+    fi
+    
+    echo "Restoring container $container_name from $backup_dir"
+    
+    # Restore volumes first
+    if [ -d "$backup_dir/volumes" ]; then
+        for volume_dir in "$backup_dir/volumes"/*; do
+            if [ -d "$volume_dir" ]; then
+                VOLUME_NAME=$(basename "$volume_dir")
+                echo "Restoring volume: $VOLUME_NAME"
+                
+                # Create volume if it doesn't exist
+                if ! docker volume inspect "$VOLUME_NAME" > /dev/null 2>&1; then
+                    docker volume create "$VOLUME_NAME"
+                fi
+                
+                # Restore volume contents
+                docker run --rm \
+                    -v "$VOLUME_NAME":/vackup-volume \
+                    -v "$volume_dir":/vackup \
+                    busybox \
+                    sh -c "tar -xzf /vackup/backup.tar.gz -C / && cp -a /vackup-volume/. /vackup-volume/"
+            fi
+        done
+    fi
+    
+    # Restore container configuration
+    CONFIG=$(cat "$backup_dir/containers/$container_name/config.json")
+    
+    # Create container with restored configuration
+    docker create --name "$container_name" \
+        --env-file "$backup_dir/containers/$container_name/env.txt" \
+        --label-file "$backup_dir/containers/$container_name/labels.txt" \
+        $(cat "$backup_dir/containers/$container_name/ports.txt" | while read port; do echo -n "-p $port "; done) \
+        $(cat "$backup_dir/containers/$container_name/volumes.txt" | while read volume; do echo -n "-v $volume "; done) \
+        $(jq -r '.Config.Image' "$backup_dir/containers/$container_name/config.json")
+    
+    echo "Successfully restored container $container_name"
 }
 
 COMMAND="$1"
@@ -227,6 +584,9 @@ case "$COMMAND" in
   import) cmd_import "$@" ;;
   save) cmd_save "$@" ;;
   load) cmd_load "$@" ;;
+  backup-container) cmd_backup_container "$@" ;;
+  backup-all) cmd_backup_all "$@" ;;
+  restore-container) cmd_restore_container "$@" ;;
   *) echo "Error: '$COMMAND' is not a recognized command" ; usage ;;
 esac
 
