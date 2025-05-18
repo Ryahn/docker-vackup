@@ -43,8 +43,39 @@ Usage:
 `vackup backup-all DIR`
   Backs up all non-blacklisted containers to a directory
 
+`vackup backup-all DIR [--hourly|--daily|--weekly]`
+  Backs up all non-blacklisted containers with retention policy:
+  - --hourly: Keeps last 6 hourly backups
+  - --daily: Keeps last 3 daily backups
+  - --weekly: Keeps last 2 weekly backups
+
 `vackup restore-container DIR CONTAINER`
   Restores the configuration and volumes of a container from a directory
+
+## Backup Retention
+
+The script supports different backup retention policies that can be specified when running `backup-all`:
+
+- Hourly backups: Keeps the last 6 hourly backups
+- Daily backups: Keeps the last 3 daily backups
+- Weekly backups: Keeps the last 2 weekly backups
+
+Example usage:
+```bash
+# Create hourly backup and maintain last 6 hourly backups
+vackup backup-all /backup/dir --hourly
+
+# Create daily backup and maintain last 3 daily backups
+vackup backup-all /backup/dir --daily
+
+# Create weekly backup and maintain last 2 weekly backups
+vackup backup-all /backup/dir --weekly
+```
+
+The backup directories will be named according to the retention type:
+- Hourly: `hourly_YYYY-MM-DD_HH`
+- Daily: `daily_YYYY-MM-DD`
+- Weekly: `weekly_YYYY-MM-DD`
 
 ## Container Blacklist
 
